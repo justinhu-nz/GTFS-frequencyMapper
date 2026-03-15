@@ -52,7 +52,7 @@
 
     /* ── Map UI ── */
     #legend {
-      position: fixed; bottom: 90px; left: 16px; z-index: 500;
+      position: fixed; bottom: 90px; left: 16px; z-index: 500; transition: bottom 0.15s ease;
       background: white; border-radius: 10px; padding: 14px 16px;
       box-shadow: 0 2px 16px rgba(0,0,0,0.13); display: none; min-width: 210px;
     }
@@ -68,6 +68,7 @@
     .li-line { width: 30px; height: 0; margin-right: 10px; flex-shrink: 0; }
     .li-text { font-size: 12px; color: #444; line-height: 1.3; }
     .li-count { font-size: 11px; color: #aaa; }
+    .li-range { font-size: 10px; color: #999; margin-top: 1px; }
     .li.off .li-text, .li.off .li-count { opacity: 0.38; }
 
     #export-btn {
@@ -285,6 +286,10 @@
           <input type="checkbox" id="corridor-mode-toggle" />
           Corridor mode
         </label>
+        <label title="Use stricter 16-min frequent threshold instead of 17-min">
+          <input type="checkbox" id="strict-freq-toggle" />
+          Strict (≤16 min)
+        </label>
         <span class="option-help" title="Count model uses average headway. Headway model uses P85 gap and requires at least 3 departures for frequent.">?</span>
       </div>
       <div class="presets" id="window-presets">
@@ -332,8 +337,8 @@
 const FREQ_THRESHOLD = 17; // minutes — ≤ this → Frequent
 const HALF_HOUR_THRESHOLD = 30; // minutes
 const HOUR_THRESHOLD = 60; // minutes
-const NEON_PINK_RED = '#ff2a6d';     // neon for <6 min
-const RED_10_OR_BETTER = '#700000';  // darker
+const NEON_PINK_RED = '#111111';     // black for <6 min
+const RED_10_OR_BETTER = '#8b0000';  // dark red, slightly lighter
 const RED_11_TO_17 = '#d7191c';      // bright red
 const BLUE_30_OR_BETTER = '#1f6fb2';
 const BLUE_60_OR_BETTER = '#8fc4f5';
@@ -348,13 +353,17 @@ const MIN_GAP = 60;        // minimum 1-hour window
 const DEFAULT_WIN = [600, 840]; // midday 10:00–14:00
 
 // Tiers in render order (bottom → top)
+const FREQ_TIERS = new Set(['freq_ultra', 'freq_very', 'freq_standard']);
+
 const TIERS = [
-  { id: 'no_service',        color: '#d5d9de', weight: 1,   opacity: 0.32, dash: '2,4', label: 'No Service'            },
-  { id: 'worse_than_60',     color: GREY_OVER_60, weight: 1.6, opacity: 0.65, dash: '4,5', label: '>60 min headway'       },
-  { id: 'every_60',          color: BLUE_60_OR_BETTER, weight: 2.4, opacity: 0.78, dash: null,  label: 'Every 31-60 min'       },
-  { id: 'every_30',          color: BLUE_30_OR_BETTER, weight: 3.4, opacity: 0.84, dash: null,  label: 'Every 18-30 min'       },
-  { id: 'frequent',          color: RED_11_TO_17, weight: 5,   opacity: 0.90, dash: null,  label: 'Every 17 min or better' },
-  { id: 'combined_frequent', color: RED_11_TO_17, weight: 6,   opacity: 0.90, dash: null,  label: 'Combined Frequent'     },
+  { id: 'no_service',        color: '#d5d9de',          weight: 1,   opacity: 0.32, dash: '2,4', label: 'No Service',          range: ''               },
+  { id: 'worse_than_60',     color: GREY_OVER_60,       weight: 1.6, opacity: 0.65, dash: '4,5', label: '>60 min headway',     range: 'Over 60 min'    },
+  { id: 'every_60',          color: BLUE_60_OR_BETTER,  weight: 2.4, opacity: 0.78, dash: null,  label: 'Every 31\u201360 min',      range: '31\u201360 min avg'   },
+  { id: 'every_30',          color: BLUE_30_OR_BETTER,  weight: 3.4, opacity: 0.84, dash: null,  label: 'Every 18\u201330 min',      range: '18\u201330 min avg'   },
+  { id: 'freq_standard',     color: RED_11_TO_17,       weight: 5,   opacity: 0.90, dash: null,  label: 'Frequent (11\u201317 min)', range: '11\u201317 min avg'   },
+  { id: 'freq_very',         color: RED_10_OR_BETTER,   weight: 5,   opacity: 0.90, dash: null,  label: 'Very frequent (6\u201310)', range: '6\u201310 min avg'    },
+  { id: 'freq_ultra',        color: NEON_PINK_RED,      weight: 5,   opacity: 0.90, dash: null,  label: 'Ultra-frequent (<6)',  range: 'Under 6 min'    },
+  { id: 'combined_frequent', color: RED_11_TO_17,       weight: 6,   opacity: 0.90, dash: null,  label: 'Combined Frequent',   range: '\u22652 routes \u226417 min' },
 ];
 
 const TIER_MAP = Object.fromEntries(TIERS.map(t => [t.id, t]));
@@ -397,9 +406,15 @@ const dayToggle    = document.getElementById('day-toggle');
 const modelToggle  = document.getElementById('model-toggle');
 const includeFrequenciesToggle = document.getElementById('include-frequencies-toggle');
 const corridorModeToggle = document.getElementById('corridor-mode-toggle');
+const strictFreqToggle = document.getElementById('strict-freq-toggle');
 const windowPresets = document.getElementById('window-presets');
 const pointControls = document.getElementById('point-controls');
 const lookaheadSelect = document.getElementById('lookahead-select');
+
+// Keep legend above time panel when it wraps to multiple rows
+new ResizeObserver(() => {
+  legend.style.bottom = (timePanel.offsetHeight + 12) + 'px';
+}).observe(timePanel);
 
 // ═══════════════════════════════════════════════════════════
 // Global state — populated by processGTFS, used by reclassify
@@ -415,12 +430,18 @@ let gTripStopTimes = new Map();    // trip_id → [{sid, dep}, ...]
 let gTripToRoute   = new Map();    // trip_id → route_id
 let gStopsMap      = new Map();    // stop_id → {lat, lon}
 let gRouteNameById = new Map();    // route_id → short name (for combined_frequent labels)
+let gStopPairGeom  = new Map();    // "stopA\0stopB" → [[lon,lat], ...] shape sub-segment
+let gRouteStopDeps = new Map();    // route_id → dir → stop_id → [dep minutes]
+let gRouteStopOrder = new Map();   // route_id → dir → [stop_id, ...] (longest trip)
 
 // Map layer refs
-let gRoutePolylines = new Map();   // route_id → L.Polyline
+let gRoutePolylines = new Map();   // route_id → L.FeatureGroup
+let gRouteSegments  = new Map();   // route_id → [{polyline, stopA, stopB}, ...]
 let gCombinedGroup  = null;        // L.FeatureGroup for combined_frequent
 let gTierVisibility = {};          // tier_id → bool
 let gLegendCounts   = {};          // tier_id → DOM span
+let gLegendTextNodes = {};         // tier_id → text node (for label updates)
+let gLegendRanges   = {};          // tier_id → DOM .li-range element
 let gCityName       = '';
 let gDataByDayByFreq = {
   with: { weekday: null, saturday: null, sunday: null },
@@ -435,6 +456,7 @@ const appState = {
   classifierModel: 'count',    // 'count' | 'headway'
   directionPolicy: 'conservative',
   corridorMode: false,
+  strictFrequent: false,
   includeFrequencies: true,
   windowStartMin: DEFAULT_WIN[0],
   windowEndMin: DEFAULT_WIN[1],
@@ -495,8 +517,9 @@ resetBtn.addEventListener('click', () => {
   // Clear global data
   gRouteIds = []; gRouteDirDeps = new Map(); gRouteCoords = new Map();
   gRouteNames = new Map(); gTripFirstDep = new Map(); gTripStopSeq = new Map(); gTripStopTimes = new Map();
-  gTripToRoute = new Map(); gStopsMap = new Map(); gRouteNameById = new Map();
-  gTierVisibility = {}; gLegendCounts = {};
+  gTripToRoute = new Map(); gStopsMap = new Map(); gRouteNameById = new Map(); gStopPairGeom = new Map();
+  gRouteStopDeps = new Map(); gRouteStopOrder = new Map(); gRouteSegments = new Map();
+  gTierVisibility = {}; gLegendCounts = {}; gLegendTextNodes = {}; gLegendRanges = {};
   gDataByDayByFreq = {
     with: { weekday: null, saturday: null, sunday: null },
     without: { weekday: null, saturday: null, sunday: null },
@@ -509,6 +532,7 @@ resetBtn.addEventListener('click', () => {
     classifierModel: 'count',
     directionPolicy: 'conservative',
     corridorMode: false,
+    strictFrequent: false,
     includeFrequencies: true,
     windowStartMin: DEFAULT_WIN[0],
     windowEndMin: DEFAULT_WIN[1],
@@ -518,6 +542,8 @@ resetBtn.addEventListener('click', () => {
   });
 
   fileInput.value = '';
+  dropTarget.style.pointerEvents = '';
+  dropTarget.style.opacity = '';
   stepsEl.innerHTML = '';
   errMsg.textContent = '';
   legend.style.display    = 'none';
@@ -583,6 +609,11 @@ includeFrequenciesToggle.addEventListener('change', e => {
 
 corridorModeToggle.addEventListener('change', e => {
   appState.corridorMode = Boolean(e.target.checked);
+  reclassifyFromState();
+});
+
+strictFreqToggle.addEventListener('change', e => {
+  appState.strictFrequent = Boolean(e.target.checked);
   reclassifyFromState();
 });
 
@@ -730,6 +761,67 @@ function parseStops(text) {
   return out;
 }
 
+// Project a point onto the nearest segment of a polyline, return the index of the
+// segment start vertex (the sub-segment extraction uses vertex indices).
+function projectOntoShape(lat, lon, shapeCoords) {
+  let bestDist = Infinity, bestIdx = 0;
+  for (let i = 0; i < shapeCoords.length; i++) {
+    const dx = shapeCoords[i][0] - lon, dy = shapeCoords[i][1] - lat;
+    const d = dx * dx + dy * dy;
+    if (d < bestDist) { bestDist = d; bestIdx = i; }
+  }
+  return bestIdx;
+}
+
+function buildStopPairGeom(allTrips, tripStopSeq, shapeGeoms, stopsMap) {
+  const out = new Map();
+  if (!shapeGeoms.size) return out;
+
+  // Group trips by shape_id — only need one trip per shape to build segments
+  const shapeTrips = new Map(); // shape_id → first trip_id that has a stop sequence
+  for (const t of allTrips) {
+    const sid = (t.shape_id || '').trim();
+    if (!sid || shapeTrips.has(sid)) continue;
+    const stops = tripStopSeq.get(t.trip_id);
+    if (stops && stops.length >= 2) shapeTrips.set(sid, t.trip_id);
+  }
+
+  for (const [shapeId, tripId] of shapeTrips) {
+    const shapeCoords = shapeGeoms.get(shapeId);
+    if (!shapeCoords || shapeCoords.length < 2) continue;
+    const stops = tripStopSeq.get(tripId);
+    if (!stops || stops.length < 2) continue;
+
+    // Project each stop onto the shape
+    const projections = [];
+    for (const stopId of stops) {
+      const s = stopsMap.get(stopId);
+      if (!s) { projections.push(null); continue; }
+      projections.push({ stopId, idx: projectOntoShape(s.lat, s.lon, shapeCoords) });
+    }
+
+    // Extract sub-segments for consecutive stop pairs
+    for (let i = 0; i < projections.length - 1; i++) {
+      const a = projections[i], b = projections[i + 1];
+      if (!a || !b) continue;
+      const key = a.stopId + '\x00' + b.stopId;
+      if (out.has(key)) continue; // already have geometry for this pair
+
+      let lo = Math.min(a.idx, b.idx);
+      let hi = Math.max(a.idx, b.idx);
+      if (hi - lo < 1) hi = lo + 1; // ensure at least 2 points
+      if (hi >= shapeCoords.length) hi = shapeCoords.length - 1;
+
+      // Slice in the direction from a to b
+      const segment = a.idx <= b.idx
+        ? shapeCoords.slice(lo, hi + 1)
+        : shapeCoords.slice(lo, hi + 1).reverse();
+      if (segment.length >= 2) out.set(key, segment);
+    }
+  }
+  return out;
+}
+
 function parseFrequenciesRows(text) {
   const out = new Map();
   for (const r of parseCSV(text)) {
@@ -808,6 +900,8 @@ function buildDayData({
   const dayTrips = allTrips.filter(t => serviceIds.has(t.service_id));
   const tripsByRoute = new Map();          // original trips (for geometry)
   const routeDirDeps = new Map();          // route_id -> dir -> departure minutes
+  const routeStopDeps = new Map();         // route_id -> dir -> stop_id -> [dep minutes]
+  const routeStopOrder = new Map();        // route_id -> dir -> [stop_id, ...] (longest trip)
   const tripShapeId  = new Map();
   const tripToRoute  = new Map();
   const dayTripStopTimes = new Map();
@@ -823,6 +917,13 @@ function buildDayData({
     const depMap = routeDirDeps.get(t.route_id);
     if (!depMap.has(dir)) depMap.set(dir, []);
 
+    if (!routeStopDeps.has(t.route_id)) routeStopDeps.set(t.route_id, new Map());
+    const rsd = routeStopDeps.get(t.route_id);
+    if (!rsd.has(dir)) rsd.set(dir, new Map());
+    const stopDepMap = rsd.get(dir);
+
+    if (!routeStopOrder.has(t.route_id)) routeStopOrder.set(t.route_id, new Map());
+
     const instances = buildTripInstances({
       tripId: t.trip_id,
       tripFirstDep,
@@ -834,6 +935,20 @@ function buildDayData({
       depMap.get(dir).push(inst.firstDep);
       tripToRoute.set(inst.id, t.route_id);
       dayTripStopTimes.set(inst.id, inst.stops);
+
+      // Per-stop departure tracking
+      for (const s of inst.stops) {
+        if (!isFinite(s.dep) || s.dep < 0) continue;
+        if (!stopDepMap.has(s.sid)) stopDepMap.set(s.sid, []);
+        stopDepMap.get(s.sid).push(s.dep);
+      }
+    }
+
+    // Track longest stop sequence per direction for stop ordering
+    const stopSeq = tripStopSeq.get(t.trip_id);
+    const rso = routeStopOrder.get(t.route_id);
+    if (stopSeq && (!rso.has(dir) || stopSeq.length > rso.get(dir).length)) {
+      rso.set(dir, stopSeq);
     }
 
     if (t.shape_id) tripShapeId.set(t.trip_id, t.shape_id);
@@ -905,6 +1020,8 @@ function buildDayData({
   return {
     routeIds,
     routeDirDeps,
+    routeStopDeps,
+    routeStopOrder,
     routeCoords,
     routeNames,
     tripToRoute,
@@ -1085,6 +1202,11 @@ async function processGTFS(file) {
   gTripStopSeq  = tripStopSeq;
   gStopsMap     = stopsMap;
 
+  // ── 7. Build stop-pair shape geometry for corridor mode ──
+  const s7 = addStep('Building corridor geometry index...');
+  gStopPairGeom = buildStopPairGeom(allTrips, tripStopSeq, shapeGeoms, stopsMap);
+  doneStep(s7, `${gStopPairGeom.size} stop-pair segments indexed`);
+
   gCityName = file.name.replace(/\.zip$/i, '').replace(/[-_]/g, ' ');
 
   return {
@@ -1098,6 +1220,8 @@ function applyDayData(dayType) {
   appState.dayType = dayType;
   gRouteIds      = day.routeIds;
   gRouteDirDeps  = day.routeDirDeps;
+  gRouteStopDeps = day.routeStopDeps || new Map();
+  gRouteStopOrder = day.routeStopOrder || new Map();
   gRouteCoords   = day.routeCoords;
   gRouteNames    = day.routeNames;
   gTripToRoute   = day.tripToRoute;
@@ -1119,6 +1243,7 @@ function updateToggleControls() {
   includeFrequenciesToggle.checked = Boolean(appState.includeFrequencies);
   includeFrequenciesToggle.disabled = !gHasFrequenciesFile;
   corridorModeToggle.checked = Boolean(appState.corridorMode);
+  strictFreqToggle.checked = Boolean(appState.strictFrequent);
   lookaheadSelect.value = String(appState.pointLookaheadMin);
 }
 
@@ -1210,8 +1335,11 @@ function departuresInWindow(deps, winStart, winEnd) {
 }
 
 function classifyMetric(metric, mode, departures) {
+  const freqCap = appState.strictFrequent ? 16 : FREQ_THRESHOLD;
   const frequentAllowed = mode !== 'headway' || departures >= 3;
-  if (frequentAllowed && metric <= FREQ_THRESHOLD) return 'frequent';
+  if (frequentAllowed && metric < 6) return 'freq_ultra';
+  if (frequentAllowed && metric <= 10) return 'freq_very';
+  if (frequentAllowed && metric <= freqCap) return 'freq_standard';
   if (metric <= HALF_HOUR_THRESHOLD) return 'every_30';
   if (metric <= HOUR_THRESHOLD) return 'every_60';
   return 'worse_than_60';
@@ -1267,8 +1395,9 @@ function evaluateDepartures(deps, winStart, winEnd, mode) {
   };
 }
 
-function evaluateRoute(dirDeps, winStart, winEnd, mode) {
-  const severity = { frequent: 0, every_30: 1, every_60: 2, worse_than_60: 3, no_service: 4 };
+const TIER_SEVERITY = { freq_ultra: 0, freq_very: 0, freq_standard: 0, every_30: 1, every_60: 2, worse_than_60: 3, no_service: 4 };
+
+function evaluateRoute(dirDeps, winStart, winEnd, mode, stopDeps) {
   const perDir = [];
   for (const [dir, deps] of dirDeps) {
     perDir.push({ dir, eval: evaluateDepartures(deps, winStart, winEnd, mode) });
@@ -1277,18 +1406,33 @@ function evaluateRoute(dirDeps, winStart, winEnd, mode) {
   if (!active.length) {
     return { tier: 'no_service', metric: Infinity, metricKind: mode === 'headway' ? 'p85_gap' : 'avg_headway', count: 0, label: 'No service in window' };
   }
-  if (active.length === 1) return active[0].eval;
 
   // Conservative policy: use worse active direction.
-  let worst = active[0].eval;
+  let worst = active.length === 1 ? active[0].eval : active[0].eval;
   for (let i = 1; i < active.length; i++) {
     const curr = active[i].eval;
-    const currSev = severity[curr.tier] ?? 99;
-    const worstSev = severity[worst.tier] ?? 99;
+    const currSev = TIER_SEVERITY[curr.tier] ?? 99;
+    const worstSev = TIER_SEVERITY[worst.tier] ?? 99;
     if (currSev > worstSev || (currSev === worstSev && curr.metric > worst.metric)) {
       worst = curr;
     }
   }
+
+  // Per-stop analysis: find the worst stop with service to detect short-turn patterns
+  if (stopDeps) {
+    for (const [dir, stopMap] of stopDeps) {
+      for (const [, deps] of stopMap) {
+        const stopEval = evaluateDepartures(deps, winStart, winEnd, mode);
+        if (stopEval.count === 0) continue; // skip stops with no service in window
+        const stopSev = TIER_SEVERITY[stopEval.tier] ?? 99;
+        const worstSev = TIER_SEVERITY[worst.tier] ?? 99;
+        if (stopSev > worstSev || (stopSev === worstSev && stopEval.metric > worst.metric)) {
+          worst = stopEval;
+        }
+      }
+    }
+  }
+
   return worst;
 }
 
@@ -1300,49 +1444,92 @@ function reclassify(winStart, winEnd) {
   const tierCounts = Object.fromEntries(TIERS.map(t => [t.id, 0]));
   gCurrentRouteTier = new Map();
 
-  // ── 1. Classify each route ──
+  // ── 1. Classify each route (per-segment) ──
   for (const rid of gRouteIds) {
     const dirDeps = gRouteDirDeps.get(rid);
     if (!dirDeps) continue;
 
-    const evalRes = evaluateRoute(dirDeps, winStart, winEnd, appState.classifierModel);
-    const tier = evalRes.tier;
-    gCurrentRouteTier.set(rid, tier);
+    const stopDeps = gRouteStopDeps.get(rid);
+    const routeEval = evaluateRoute(dirDeps, winStart, winEnd, appState.classifierModel, stopDeps);
+    gCurrentRouteTier.set(rid, routeEval.tier);
+    tierCounts[routeEval.tier]++;
 
-    tierCounts[tier]++;
+    const segments = gRouteSegments.get(rid);
+    const fg = gRoutePolylines.get(rid);
+    if (!fg || !segments) continue;
 
-    // Update polyline style
-    const pl = gRoutePolylines.get(rid);
-    if (pl) {
-      const t = TIER_MAP[tier];
-      const isVisible = gTierVisibility[tier] !== false;
-      const dynamicColor = tier === 'no_service' ? t.color : colorForMetric(evalRes.metric);
-      const routeOpacity = isVisible ? (
+    // Build per-stop evaluation cache using the direction with the most stops (matches segment geometry)
+    const stopEvalCache = new Map(); // stop_id → evalResult
+    if (stopDeps) {
+      const stopOrder = gRouteStopOrder.get(rid);
+      let bestDir = null, bestLen = 0;
+      if (stopOrder) {
+        for (const [dir, stops] of stopOrder) {
+          if (stops.length > bestLen) { bestLen = stops.length; bestDir = dir; }
+        }
+      }
+      // Use best direction's stop data, fall back to any direction
+      const dirToUse = bestDir !== null && stopDeps.has(bestDir) ? [bestDir] : [...stopDeps.keys()];
+      for (const dir of dirToUse) {
+        const stopMap = stopDeps.get(dir);
+        if (!stopMap) continue;
+        for (const [sid, deps] of stopMap) {
+          if (stopEvalCache.has(sid)) continue;
+          stopEvalCache.set(sid, evaluateDepartures(deps, winStart, winEnd, appState.classifierModel));
+        }
+      }
+    }
+
+    const name = gRouteNames.get(rid) || rid;
+
+    for (const seg of segments) {
+      let segEval = routeEval; // default: use route-level eval
+
+      // If segment has stop info and we have per-stop data, use worst of the two stops
+      if (seg.stopA && seg.stopB && stopEvalCache.size > 0) {
+        const evalA = stopEvalCache.get(seg.stopA);
+        const evalB = stopEvalCache.get(seg.stopB);
+        if (evalA && evalB) {
+          const sevA = TIER_SEVERITY[evalA.tier] ?? 99;
+          const sevB = TIER_SEVERITY[evalB.tier] ?? 99;
+          segEval = sevA >= sevB ? evalA : evalB; // use worse stop
+          if (sevA === sevB && evalA.metric < evalB.metric) segEval = evalB;
+        } else if (evalA) {
+          segEval = evalA;
+        } else if (evalB) {
+          segEval = evalB;
+        }
+      }
+
+      const segTier = segEval.tier;
+      const t = TIER_MAP[segTier];
+      const isVisible = gTierVisibility[segTier] !== false;
+      const dynamicColor = segTier === 'no_service' ? t.color : colorForMetric(segEval.metric);
+      const segOpacity = isVisible ? (
         appState.corridorMode
-          ? (tier === 'frequent' ? t.opacity : (tier === 'every_30' ? t.opacity * 0.45 : t.opacity * 0.30))
+          ? (FREQ_TIERS.has(segTier) ? t.opacity : (segTier === 'every_30' ? t.opacity * 0.45 : t.opacity * 0.30))
           : t.opacity
       ) : 0;
-      pl.setStyle({
+      seg.polyline.setStyle({
         color:     dynamicColor,
         weight:    t.weight,
-        opacity:   routeOpacity,
+        opacity:   segOpacity,
         dashArray: t.dash || '',
       });
 
-      // Update tooltip
-      const name = gRouteNames.get(rid) || rid;
+      // Tooltip per segment
       const tooltipText = `<strong>Route ${name}</strong><br>` +
         `${t.label}<br>` +
-        evalRes.label +
-        `<br><em>${evalRes.metricKind === 'p85_gap' ? 'P85 gap metric' : 'Average headway metric'}</em>`;
-      pl.unbindTooltip();
-      pl.bindTooltip(tooltipText, { sticky: true, direction: 'top' });
+        segEval.label +
+        `<br><em>${segEval.metricKind === 'p85_gap' ? 'P85 gap metric' : 'Average headway metric'}</em>`;
+      seg.polyline.unbindTooltip();
+      seg.polyline.bindTooltip(tooltipText, { sticky: true, direction: 'top' });
     }
   }
 
   // ── 2. Bring frequent routes to front ──
   // Draw order: weakest service first, strongest last
-  for (const tier of ['no_service', 'worse_than_60', 'every_60', 'every_30', 'frequent']) {
+  for (const tier of ['no_service', 'worse_than_60', 'every_60', 'every_30', 'freq_standard', 'freq_very', 'freq_ultra']) {
     for (const rid of gRouteIds) {
       const pl = gRoutePolylines.get(rid);
       if (!pl) continue;
@@ -1386,20 +1573,30 @@ function reclassify(winStart, winEnd) {
     for (const entry of pairData.values()) {
       if (entry.routes.size < 2 || entry.count <= 0) continue;
       const evalRes = evaluateDepartures(entry.departures, winStart, winEnd, appState.classifierModel);
-      const qualifies = evalRes.tier === 'frequent';
+      const qualifies = FREQ_TIERS.has(evalRes.tier);
       if (!qualifies) continue;
       combCount++;
 
       if (!appState.corridorMode) continue;
+      // Respect sub-tier visibility: if the color tier this segment falls into is hidden, skip it
+      if (gTierVisibility[evalRes.tier] === false) continue;
       const sA = gStopsMap.get(entry.stopA);
       const sB = gStopsMap.get(entry.stopB);
       if (!sA || !sB) continue;
+
+      // Use shape geometry if available, fall back to straight line
+      const pairKey = entry.stopA + '\x00' + entry.stopB;
+      const segCoords = gStopPairGeom.get(pairKey);
+      const latlngs = segCoords
+        ? segCoords.map(([lon, lat]) => [lat, lon])
+        : [[sA.lat, sA.lon], [sB.lat, sB.lon]];
+
       const segKm = L.latLng(sA.lat, sA.lon).distanceTo(L.latLng(sB.lat, sB.lon)) / 1000;
       const segKmLabel = `${Math.round(segKm * 100) / 100} km`;
 
       const routeLabels = [...entry.routes].map(rid => gRouteNames.get(rid) || rid).join(' + ');
 
-      L.polyline([[sA.lat, sA.lon], [sB.lat, sB.lon]], {
+      L.polyline(latlngs, {
         color:   colorForMetric(evalRes.metric),
         weight:  combTier.weight,
         opacity: combTier.opacity,
@@ -1423,22 +1620,39 @@ function reclassify(winStart, winEnd) {
     gCombinedGroup.addTo(map);
   }
 
-  // ── 4. Update legend counts ──
+  // ── 4. Update legend counts and strict-mode labels ──
+  const strict = appState.strictFrequent;
   for (const tier of TIERS) {
     const span = gLegendCounts[tier.id];
     if (span) span.textContent = `(${tierCounts[tier.id]})`;
   }
+  // Update labels that shift with strict threshold
+  if (gLegendTextNodes['freq_standard']) {
+    gLegendTextNodes['freq_standard'].textContent = strict ? 'Frequent (11\u201316 min) ' : 'Frequent (11\u201317 min) ';
+  }
+  if (gLegendRanges['freq_standard']) {
+    gLegendRanges['freq_standard'].textContent = strict ? '11\u201316 min avg' : '11\u201317 min avg';
+  }
+  if (gLegendTextNodes['every_30']) {
+    gLegendTextNodes['every_30'].textContent = strict ? 'Every 17\u201330 min ' : 'Every 18\u201330 min ';
+  }
+  if (gLegendRanges['every_30']) {
+    gLegendRanges['every_30'].textContent = strict ? '17\u201330 min avg' : '18\u201330 min avg';
+  }
 
   // ── 5. Update stats pill ──
   const total = gRouteIds.length;
-  const freq17 = tierCounts['frequent'] || 0;
+  const ultra  = tierCounts['freq_ultra'] || 0;
+  const vfreq  = tierCounts['freq_very'] || 0;
+  const sfreq  = tierCounts['freq_standard'] || 0;
   const every30 = tierCounts['every_30'] || 0;
   const every60 = tierCounts['every_60'] || 0;
   const over60 = tierCounts['worse_than_60'] || 0;
   const comb  = tierCounts['combined_frequent'] || 0;
   const modeLabel = appState.classifierModel === 'headway' ? 'headway model (P85)' : 'count model (avg)';
   const tabLabel = appState.analysisTab === 'point' ? 'point-in-time' : 'window';
-  statsPill.textContent = `${appState.dayType} · ${tabLabel} · ${modeLabel}: ${total} routes · <=17 ${freq17} · <=30 ${every30} · <=60 ${every60} · >60 ${over60}` +
+  const fc = strict ? 16 : 17;
+  statsPill.textContent = `${appState.dayType} · ${tabLabel} · ${modeLabel}: ${total} routes · <6 ${ultra} · \u226410 ${vfreq} · \u2264${fc} ${sfreq} · \u226430 ${every30} · \u226460 ${every60} · >60 ${over60}` +
     (comb > 0 ? ` · ${comb} combined segments` : '');
 }
 
@@ -1453,20 +1667,60 @@ function renderMap(meta, options = {}) {
   gRoutePolylines = new Map();
   gTierVisibility = { ...appState.tierVisibility };
 
-  // Create a polyline for each route (initially styled as no_service; reclassify will fix)
+  // Create polylines for each route — segment-based if stop-pair geometry is available
   const noSvc = TIER_MAP['no_service'];
+  const noSvcStyle = { color: noSvc.color, weight: noSvc.weight, opacity: noSvc.opacity, dashArray: noSvc.dash || '' };
+
   for (const rid of gRouteIds) {
-    const coords  = gRouteCoords.get(rid);
-    const latlngs = coords.map(([lon, lat]) => [lat, lon]);
+    const stopOrder = gRouteStopOrder.get(rid);
+    const segments = [];
+    let usedSegments = false;
 
-    const pl = L.polyline(latlngs, {
-      color:     noSvc.color,
-      weight:    noSvc.weight,
-      opacity:   noSvc.opacity,
-      dashArray: noSvc.dash || '',
-    }).addTo(map);
+    // Try segment-based rendering using stop order + shape geometry
+    if (stopOrder) {
+      // Pick direction with most stops
+      let bestStops = null;
+      for (const [, stops] of stopOrder) {
+        if (!bestStops || stops.length > bestStops.length) bestStops = stops;
+      }
+      if (bestStops && bestStops.length >= 2) {
+        let allFound = true;
+        for (let i = 0; i < bestStops.length - 1; i++) {
+          const sA = bestStops[i], sB = bestStops[i + 1];
+          const key = sA + '\x00' + sB;
+          const segCoords = gStopPairGeom.get(key);
+          if (segCoords && segCoords.length >= 2) {
+            const latlngs = segCoords.map(([lon, lat]) => [lat, lon]);
+            segments.push({ polyline: L.polyline(latlngs, noSvcStyle), stopA: sA, stopB: sB });
+          } else {
+            // Try stop coords as fallback for this pair
+            const sa = gStopsMap.get(sA), sb = gStopsMap.get(sB);
+            if (sa && sb) {
+              segments.push({ polyline: L.polyline([[sa.lat, sa.lon], [sb.lat, sb.lon]], noSvcStyle), stopA: sA, stopB: sB });
+            } else {
+              allFound = false;
+              break;
+            }
+          }
+        }
+        if (allFound && segments.length > 0) usedSegments = true;
+      }
+    }
 
-    gRoutePolylines.set(rid, pl);
+    const fg = L.featureGroup();
+    if (usedSegments) {
+      for (const seg of segments) seg.polyline.addTo(fg);
+      gRouteSegments.set(rid, segments);
+    } else {
+      // Fallback: single polyline for the whole route
+      const coords = gRouteCoords.get(rid);
+      const latlngs = coords.map(([lon, lat]) => [lat, lon]);
+      const pl = L.polyline(latlngs, noSvcStyle);
+      pl.addTo(fg);
+      gRouteSegments.set(rid, [{ polyline: pl, stopA: null, stopB: null }]);
+    }
+    fg.addTo(map);
+    gRoutePolylines.set(rid, fg);
   }
 
   // Create combined_frequent layer group
@@ -1479,7 +1733,7 @@ function renderMap(meta, options = {}) {
 
   // Build legend
   legend.querySelectorAll('.li').forEach(el => el.remove());
-  gLegendCounts = {};
+  gLegendCounts = {}; gLegendTextNodes = {}; gLegendRanges = {};
 
   for (const tier of [...TIERS].reverse()) {
     const item = document.createElement('div');
@@ -1492,12 +1746,22 @@ function renderMap(meta, options = {}) {
 
     const textEl = document.createElement('div');
     textEl.className = 'li-text';
+    const labelNode = document.createTextNode(tier.label + ' ');
+    textEl.appendChild(labelNode);
     const countSpan = document.createElement('span');
     countSpan.className = 'li-count';
     countSpan.textContent = '(0)';
-    textEl.textContent = tier.label + ' ';
     textEl.appendChild(countSpan);
+    let rangeEl = null;
+    if (tier.range) {
+      rangeEl = document.createElement('div');
+      rangeEl.className = 'li-range';
+      rangeEl.textContent = tier.range;
+      textEl.appendChild(rangeEl);
+    }
     gLegendCounts[tier.id] = countSpan;
+    gLegendTextNodes[tier.id] = labelNode;
+    gLegendRanges[tier.id] = rangeEl;
 
     item.appendChild(lineEl);
     item.appendChild(textEl);
@@ -1545,8 +1809,9 @@ function renderMap(meta, options = {}) {
     for (const rid of gRouteIds) {
       const coords = gRouteCoords.get(rid);
       const dirDeps = gRouteDirDeps.get(rid);
+      const stopDeps = gRouteStopDeps.get(rid);
       const evalRes = dirDeps
-        ? evaluateRoute(dirDeps, ws, we, appState.classifierModel)
+        ? evaluateRoute(dirDeps, ws, we, appState.classifierModel, stopDeps)
         : { tier: 'no_service', metric: Infinity, metricKind: appState.classifierModel === 'headway' ? 'p85_gap' : 'avg_headway', count: 0 };
 
       features.push({
