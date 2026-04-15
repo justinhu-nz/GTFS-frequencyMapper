@@ -40,6 +40,14 @@
     #drop-target .ico  { font-size: 42px; line-height: 1; margin-bottom: 10px; }
     #drop-target .pri  { font-size: 15px; font-weight: 600; color: #222; }
     #drop-target .sec  { font-size: 13px; color: #999; margin-top: 4px; }
+    .demo-cta {
+      margin-top: 12px; width: 100%;
+      background: #111; color: #fff; border: none; border-radius: 10px;
+      padding: 11px 14px; font-size: 14px; font-weight: 600; cursor: pointer;
+      transition: background 0.2s, opacity 0.2s;
+    }
+    .demo-cta:hover { background: #2a2a2a; }
+    .demo-cta:disabled { opacity: 0.55; cursor: wait; }
 
     #steps {
       margin-top: 18px; text-align: left; font-size: 12.5px;
@@ -140,6 +148,17 @@
     }
     .model-btn:hover { background: #f3f5f7; }
     .model-btn.active { background: #2471a3; color: #fff; border-color: #2471a3; }
+    .dir-toggle {
+      display: flex; gap: 6px; flex-wrap: wrap; margin-right: 8px;
+    }
+    .dir-btn {
+      background: #fff; border: 1px solid #d5d9de; border-radius: 5px;
+      padding: 4px 10px; font-size: 11px; cursor: pointer;
+      color: #444; font-weight: 600; white-space: nowrap;
+      transition: background 0.15s, border-color 0.15s, color 0.15s;
+    }
+    .dir-btn:hover { background: #f3f5f7; }
+    .dir-btn.active { background: #6c3483; color: #fff; border-color: #6c3483; }
     .option-toggles {
       display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
       font-size: 11px; color: #444;
@@ -246,6 +265,7 @@
       <div class="sec">or click to browse</div>
       <input id="file-input" type="file" accept=".zip" style="display:none" />
     </div>
+    <button id="demo-btn" class="demo-cta" type="button">Try Auckland Demo</button>
     <div id="steps"></div>
     <div id="err-msg"></div>
   </div>
@@ -274,16 +294,21 @@
         <button class="day-btn" data-day="sunday">Sunday</button>
       </div>
       <div class="model-toggle" id="model-toggle">
-        <button class="model-btn active" data-model="count">Count Model</button>
-        <button class="model-btn" data-model="headway">Headway Model</button>
+        <button class="model-btn" data-model="count">Count Model</button>
+        <button class="model-btn active" data-model="headway">Headway Model</button>
       </div>
-      <div class="option-toggles">
+      <div class="dir-toggle" id="dir-toggle">
+          <button class="dir-btn active" data-dir="both">Both Dirs</button>
+          <button class="dir-btn" data-dir="0">Dir A</button>
+          <button class="dir-btn" data-dir="1">Dir B</button>
+        </div>
+        <div class="option-toggles">
         <label title="Include departures generated from frequencies.txt if available">
           <input type="checkbox" id="include-frequencies-toggle" checked />
           Include frequencies.txt
         </label>
         <label title="Emphasize combined corridors and de-emphasize route lines">
-          <input type="checkbox" id="corridor-mode-toggle" />
+          <input type="checkbox" id="corridor-mode-toggle" checked />
           Corridor mode
         </label>
         <label title="Use stricter 16-min frequent threshold instead of 17-min">
@@ -367,6 +392,7 @@ const TIERS = [
 ];
 
 const TIER_MAP = Object.fromEntries(TIERS.map(t => [t.id, t]));
+const COLOR_DRAW_ORDER = ['no_service', 'worse_than_60', 'every_60', 'every_30', 'freq_standard', 'freq_very', 'freq_ultra'];
 
 // ═══════════════════════════════════════════════════════════
 // Map
@@ -386,6 +412,7 @@ L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
 const overlay      = document.getElementById('overlay');
 const dropTarget   = document.getElementById('drop-target');
 const fileInput    = document.getElementById('file-input');
+const demoBtn      = document.getElementById('demo-btn');
 const stepsEl      = document.getElementById('steps');
 const errMsg       = document.getElementById('err-msg');
 const legend       = document.getElementById('legend');
@@ -407,6 +434,7 @@ const modelToggle  = document.getElementById('model-toggle');
 const includeFrequenciesToggle = document.getElementById('include-frequencies-toggle');
 const corridorModeToggle = document.getElementById('corridor-mode-toggle');
 const strictFreqToggle = document.getElementById('strict-freq-toggle');
+const dirToggle    = document.getElementById('dir-toggle');
 const windowPresets = document.getElementById('window-presets');
 const pointControls = document.getElementById('point-controls');
 const lookaheadSelect = document.getElementById('lookahead-select');
@@ -433,6 +461,8 @@ let gRouteNameById = new Map();    // route_id → short name (for combined_freq
 let gStopPairGeom  = new Map();    // "stopA\0stopB" → [[lon,lat], ...] shape sub-segment
 let gRouteStopDeps = new Map();    // route_id → dir → stop_id → [dep minutes]
 let gRouteStopOrder = new Map();   // route_id → dir → [stop_id, ...] (longest trip)
+let gTripToDir     = new Map();    // trip_id → direction_id string
+let gRouteDirHeadsigns = new Map(); // route_id → Map<dir, Set<headsign>>
 
 // Map layer refs
 let gRoutePolylines = new Map();   // route_id → L.FeatureGroup
@@ -450,12 +480,16 @@ let gDataByDayByFreq = {
 let gHasFrequenciesFile = false;
 let gCurrentRouteTier = new Map(); // route_id -> current tier id
 
+const AUCKLAND_DEMO_URL = 'https://raw.githubusercontent.com/justinhu-nz/GTFS-frequencyMapper/main/auckland%20gtfs%20(2).zip';
+const AUCKLAND_DEMO_NAME = 'auckland-demo.zip';
+
 const appState = {
   dayType: 'weekday',
   analysisTab: 'window',       // 'window' | 'point'
-  classifierModel: 'count',    // 'count' | 'headway'
+  classifierModel: 'headway',  // 'count' | 'headway'
   directionPolicy: 'conservative',
-  corridorMode: false,
+  directionFilter: 'both',          // 'both' | '0' | '1'
+  corridorMode: true,
   strictFrequent: false,
   includeFrequencies: true,
   windowStartMin: DEFAULT_WIN[0],
@@ -485,6 +519,7 @@ function showErr(msg) {
   errMsg.textContent = msg;
   dropTarget.style.opacity = '';
   dropTarget.style.pointerEvents = '';
+  demoBtn.disabled = false;
 }
 
 function fmtTime(minutes) {
@@ -495,10 +530,76 @@ function fmtTime(minutes) {
   return String(h).padStart(2, '0') + ':' + String(m).padStart(2, '0') + suffix;
 }
 
+function formatDownloadStep(loadedBytes, totalBytes = 0) {
+  const loadedMb = Math.round((loadedBytes / 1024 / 1024) * 10) / 10;
+  if (totalBytes > 0) {
+    const totalMb = Math.round((totalBytes / 1024 / 1024) * 10) / 10;
+    const pct = Math.round((loadedBytes / totalBytes) * 100);
+    return `Downloading Auckland demo... ${pct}% (${loadedMb} / ${totalMb} MB)`;
+  }
+  return `Downloading Auckland demo... ${loadedMb} MB`;
+}
+
+function createNamedZipFile(blob, name) {
+  try {
+    return new File([blob], name, { type: blob.type || 'application/zip' });
+  } catch {
+    blob.name = name;
+    return blob;
+  }
+}
+
+async function loadAucklandDemo() {
+  dropTarget.style.pointerEvents = 'none';
+  dropTarget.style.opacity = '0.5';
+  demoBtn.disabled = true;
+  errMsg.textContent = '';
+  stepsEl.innerHTML = '';
+
+  const downloadStep = addStep('Downloading Auckland demo...');
+
+  try {
+    const response = await fetch(AUCKLAND_DEMO_URL);
+    if (!response.ok) {
+      throw new Error(`Demo download failed (${response.status})`);
+    }
+
+    const totalBytes = parseInt(response.headers.get('content-length') || '0', 10);
+    let blob;
+
+    if (response.body && response.body.getReader) {
+      const reader = response.body.getReader();
+      const chunks = [];
+      let loadedBytes = 0;
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (!value) continue;
+        chunks.push(value);
+        loadedBytes += value.byteLength;
+        downloadStep.textContent = '⋯ ' + formatDownloadStep(loadedBytes, totalBytes);
+      }
+
+      blob = new Blob(chunks, { type: response.headers.get('content-type') || 'application/zip' });
+    } else {
+      blob = await response.blob();
+      downloadStep.textContent = '⋯ ' + formatDownloadStep(blob.size, totalBytes || blob.size);
+    }
+
+    doneStep(downloadStep, `Auckland demo downloaded (${Math.round((blob.size / 1024 / 1024) * 10) / 10} MB)`);
+    await kick(createNamedZipFile(blob, AUCKLAND_DEMO_NAME), { preserveSteps: true });
+  } catch (err) {
+    console.error(err);
+    showErr('⚠ ' + (err.message || 'Failed to download Auckland demo.'));
+  }
+}
+
 // ── File input wiring ──
 
 dropTarget.addEventListener('click', () => fileInput.click());
 fileInput.addEventListener('change', e => { if (e.target.files[0]) kick(e.target.files[0]); });
+demoBtn.addEventListener('click', () => loadAucklandDemo());
 dropTarget.addEventListener('dragover', e => { e.preventDefault(); dropTarget.classList.add('hover'); });
 dropTarget.addEventListener('dragleave', () => dropTarget.classList.remove('hover'));
 dropTarget.addEventListener('drop', e => {
@@ -519,6 +620,7 @@ resetBtn.addEventListener('click', () => {
   gRouteNames = new Map(); gTripFirstDep = new Map(); gTripStopSeq = new Map(); gTripStopTimes = new Map();
   gTripToRoute = new Map(); gStopsMap = new Map(); gRouteNameById = new Map(); gStopPairGeom = new Map();
   gRouteStopDeps = new Map(); gRouteStopOrder = new Map(); gRouteSegments = new Map();
+  gTripToDir = new Map(); gRouteDirHeadsigns = new Map();
   gTierVisibility = {}; gLegendCounts = {}; gLegendTextNodes = {}; gLegendRanges = {};
   gDataByDayByFreq = {
     with: { weekday: null, saturday: null, sunday: null },
@@ -529,9 +631,10 @@ resetBtn.addEventListener('click', () => {
   Object.assign(appState, {
     dayType: 'weekday',
     analysisTab: 'window',
-    classifierModel: 'count',
+    classifierModel: 'headway',
     directionPolicy: 'conservative',
-    corridorMode: false,
+    directionFilter: 'both',
+    corridorMode: true,
     strictFrequent: false,
     includeFrequencies: true,
     windowStartMin: DEFAULT_WIN[0],
@@ -544,6 +647,7 @@ resetBtn.addEventListener('click', () => {
   fileInput.value = '';
   dropTarget.style.pointerEvents = '';
   dropTarget.style.opacity = '';
+  demoBtn.disabled = false;
   stepsEl.innerHTML = '';
   errMsg.textContent = '';
   legend.style.display    = 'none';
@@ -558,6 +662,7 @@ resetBtn.addEventListener('click', () => {
   setActiveAnalysisButton(appState.analysisTab);
   setActiveDayButton(appState.dayType);
   setActiveModelButton(appState.classifierModel);
+  setActiveDirectionButton(appState.directionFilter);
   updateToggleControls();
   updateAnalysisControlsUI();
 });
@@ -598,6 +703,16 @@ modelToggle.addEventListener('click', e => {
   reclassifyFromState();
 });
 
+dirToggle.addEventListener('click', e => {
+  const btn = e.target.closest('.dir-btn');
+  if (!btn) return;
+  const nextDir = btn.dataset.dir;
+  if (nextDir === appState.directionFilter) return;
+  appState.directionFilter = nextDir;
+  setActiveDirectionButton(nextDir);
+  renderMap({ bounds: null }, { preserveView: true });
+});
+
 includeFrequenciesToggle.addEventListener('change', e => {
   if (!gHasFrequenciesFile) return;
   appState.includeFrequencies = Boolean(e.target.checked);
@@ -633,8 +748,8 @@ function parseTime(t) {
   if (!t) return -1;
   const p = t.trim().split(':');
   if (p.length < 2) return -1;
-  const h = parseInt(p[0], 10), m = parseInt(p[1], 10);
-  return (isNaN(h) || isNaN(m)) ? -1 : h * 60 + m;
+  const h = parseInt(p[0], 10), m = parseInt(p[1], 10), s = parseInt(p[2] ?? '0', 10);
+  return (isNaN(h) || isNaN(m) || isNaN(s)) ? -1 : h * 60 + m + s / 60;
 }
 
 function parseCSV(text) {
@@ -904,6 +1019,8 @@ function buildDayData({
   const routeStopOrder = new Map();        // route_id -> dir -> [stop_id, ...] (longest trip)
   const tripShapeId  = new Map();
   const tripToRoute  = new Map();
+  const tripToDir    = new Map();
+  const routeDirHeadsigns = new Map();
   const dayTripStopTimes = new Map();
 
   for (const t of dayTrips) {
@@ -912,6 +1029,14 @@ function buildDayData({
     const dirMap = tripsByRoute.get(t.route_id);
     if (!dirMap.has(dir)) dirMap.set(dir, []);
     dirMap.get(dir).push(t.trip_id);
+
+    // Track trip→direction and headsigns per direction
+    tripToDir.set(t.trip_id, dir);
+    if (!routeDirHeadsigns.has(t.route_id)) routeDirHeadsigns.set(t.route_id, new Map());
+    const hsMap = routeDirHeadsigns.get(t.route_id);
+    if (!hsMap.has(dir)) hsMap.set(dir, new Set());
+    const hs = (t.trip_headsign || '').trim();
+    if (hs) hsMap.get(dir).add(hs);
 
     if (!routeDirDeps.has(t.route_id)) routeDirDeps.set(t.route_id, new Map());
     const depMap = routeDirDeps.get(t.route_id);
@@ -934,6 +1059,7 @@ function buildDayData({
     for (const inst of instances) {
       depMap.get(dir).push(inst.firstDep);
       tripToRoute.set(inst.id, t.route_id);
+      tripToDir.set(inst.id, dir);
       dayTripStopTimes.set(inst.id, inst.stops);
 
       // Per-stop departure tracking
@@ -1025,6 +1151,8 @@ function buildDayData({
     routeCoords,
     routeNames,
     tripToRoute,
+    tripToDir,
+    routeDirHeadsigns,
     tripStopTimes: dayTripStopTimes,
     bounds: isFinite(minLat) ? [[minLat, minLon], [maxLat, maxLon]] : null,
     skipped,
@@ -1036,11 +1164,12 @@ function buildDayData({
 // Core: load + parse GTFS (no classification — that's reclassify's job)
 // ═══════════════════════════════════════════════════════════
 
-async function kick(file) {
+async function kick(file, options = {}) {
   dropTarget.style.pointerEvents = 'none';
   dropTarget.style.opacity = '0.5';
+  demoBtn.disabled = true;
   errMsg.textContent = '';
-  stepsEl.innerHTML = '';
+  if (!options.preserveSteps) stepsEl.innerHTML = '';
 
   try {
     const meta = await processGTFS(file);
@@ -1225,6 +1354,8 @@ function applyDayData(dayType) {
   gRouteCoords   = day.routeCoords;
   gRouteNames    = day.routeNames;
   gTripToRoute   = day.tripToRoute;
+  gTripToDir     = day.tripToDir || new Map();
+  gRouteDirHeadsigns = day.routeDirHeadsigns || new Map();
   gTripStopTimes = day.tripStopTimes || new Map();
   gRouteNameById = day.routeNames;
   return true;
@@ -1245,6 +1376,7 @@ function updateToggleControls() {
   corridorModeToggle.checked = Boolean(appState.corridorMode);
   strictFreqToggle.checked = Boolean(appState.strictFrequent);
   lookaheadSelect.value = String(appState.pointLookaheadMin);
+  setActiveDirectionButton(appState.directionFilter);
 }
 
 function setActiveAnalysisButton(tab) {
@@ -1265,6 +1397,17 @@ function setActiveModelButton(mode) {
   });
 }
 
+function setActiveDirectionButton(dir) {
+  dirToggle.querySelectorAll('.dir-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.dir === dir);
+  });
+}
+
+function updateLegendTitle() {
+  const dirLabel = appState.directionFilter === 'both' ? 'both dirs' : `dir ${appState.directionFilter}`;
+  legendTitle.textContent = `${gCityName || 'Frequency Tiers'} (${appState.dayType}, ${appState.analysisTab}, ${appState.classifierModel}, ${dirLabel})`;
+}
+
 function getActiveWindow() {
   if (appState.analysisTab === 'point') {
     const maxStart = Math.max(SLIDER_MIN, SLIDER_MAX - appState.pointLookaheadMin);
@@ -1281,6 +1424,7 @@ function getActiveWindow() {
 function reclassifyFromState() {
   const [ws, we] = getActiveWindow();
   updateSliderUI(ws, we);
+  updateLegendTitle();
   reclassify(ws, we);
 }
 
@@ -1397,9 +1541,10 @@ function evaluateDepartures(deps, winStart, winEnd, mode) {
 
 const TIER_SEVERITY = { freq_ultra: 0, freq_very: 0, freq_standard: 0, every_30: 1, every_60: 2, worse_than_60: 3, no_service: 4 };
 
-function evaluateRoute(dirDeps, winStart, winEnd, mode, stopDeps) {
+function evaluateRoute(dirDeps, winStart, winEnd, mode, stopDeps, dirFilter) {
   const perDir = [];
   for (const [dir, deps] of dirDeps) {
+    if (dirFilter && dirFilter !== 'both' && dir !== dirFilter) continue;
     perDir.push({ dir, eval: evaluateDepartures(deps, winStart, winEnd, mode) });
   }
   const active = perDir.filter(d => d.eval.count > 0);
@@ -1421,6 +1566,7 @@ function evaluateRoute(dirDeps, winStart, winEnd, mode, stopDeps) {
   // Per-stop analysis: find the worst stop with service to detect short-turn patterns
   if (stopDeps) {
     for (const [dir, stopMap] of stopDeps) {
+      if (dirFilter && dirFilter !== 'both' && dir !== dirFilter) continue;
       for (const [, deps] of stopMap) {
         const stopEval = evaluateDepartures(deps, winStart, winEnd, mode);
         if (stopEval.count === 0) continue; // skip stops with no service in window
@@ -1436,6 +1582,34 @@ function evaluateRoute(dirDeps, winStart, winEnd, mode, stopDeps) {
   return worst;
 }
 
+function normalizeDrawTier(tier) {
+  if (tier === 'combined_frequent') return 'freq_standard';
+  return COLOR_DRAW_ORDER.includes(tier) ? tier : 'no_service';
+}
+
+function bringServiceLayersToFront() {
+  const buckets = Object.fromEntries(COLOR_DRAW_ORDER.map(tier => [tier, []]));
+
+  for (const rid of gRouteIds) {
+    const segments = gRouteSegments.get(rid) || [];
+    for (const seg of segments) {
+      const tier = normalizeDrawTier(seg.drawTier);
+      buckets[tier].push(seg.polyline);
+    }
+  }
+
+  if (gCombinedGroup) {
+    gCombinedGroup.eachLayer(layer => {
+      const tier = normalizeDrawTier(layer._fmDrawTier);
+      buckets[tier].push(layer);
+    });
+  }
+
+  for (const tier of COLOR_DRAW_ORDER) {
+    for (const layer of buckets[tier]) layer.bringToFront();
+  }
+}
+
 // ═══════════════════════════════════════════════════════════
 // Reclassify — called on every slider change
 // ═══════════════════════════════════════════════════════════
@@ -1443,6 +1617,7 @@ function evaluateRoute(dirDeps, winStart, winEnd, mode, stopDeps) {
 function reclassify(winStart, winEnd) {
   const tierCounts = Object.fromEntries(TIERS.map(t => [t.id, 0]));
   gCurrentRouteTier = new Map();
+  const dirFilter = appState.directionFilter;
 
   // ── 1. Classify each route (per-segment) ──
   for (const rid of gRouteIds) {
@@ -1450,7 +1625,7 @@ function reclassify(winStart, winEnd) {
     if (!dirDeps) continue;
 
     const stopDeps = gRouteStopDeps.get(rid);
-    const routeEval = evaluateRoute(dirDeps, winStart, winEnd, appState.classifierModel, stopDeps);
+    const routeEval = evaluateRoute(dirDeps, winStart, winEnd, appState.classifierModel, stopDeps, dirFilter);
     gCurrentRouteTier.set(rid, routeEval.tier);
     tierCounts[routeEval.tier]++;
 
@@ -1458,19 +1633,22 @@ function reclassify(winStart, winEnd) {
     const fg = gRoutePolylines.get(rid);
     if (!fg || !segments) continue;
 
-    // Build per-stop evaluation cache using the direction with the most stops (matches segment geometry)
+    // Build per-stop evaluation cache using the direction that matches segment geometry
     const stopEvalCache = new Map(); // stop_id → evalResult
     if (stopDeps) {
       const stopOrder = gRouteStopOrder.get(rid);
       let bestDir = null, bestLen = 0;
       if (stopOrder) {
         for (const [dir, stops] of stopOrder) {
+          if (dirFilter !== 'both' && dir !== dirFilter) continue;
           if (stops.length > bestLen) { bestLen = stops.length; bestDir = dir; }
         }
       }
-      // Use best direction's stop data, fall back to any direction
-      const dirToUse = bestDir !== null && stopDeps.has(bestDir) ? [bestDir] : [...stopDeps.keys()];
-      for (const dir of dirToUse) {
+      // Use best direction's stop data, fall back to any matching direction
+      const availDirs = dirFilter !== 'both'
+        ? (stopDeps.has(dirFilter) ? [dirFilter] : [])
+        : (bestDir !== null && stopDeps.has(bestDir) ? [bestDir] : [...stopDeps.keys()]);
+      for (const dir of availDirs) {
         const stopMap = stopDeps.get(dir);
         if (!stopMap) continue;
         for (const [sid, deps] of stopMap) {
@@ -1505,6 +1683,7 @@ function reclassify(winStart, winEnd) {
       const t = TIER_MAP[segTier];
       const isVisible = gTierVisibility[segTier] !== false;
       const dynamicColor = segTier === 'no_service' ? t.color : colorForMetric(segEval.metric);
+      seg.drawTier = segTier;
       const segOpacity = isVisible ? (
         appState.corridorMode
           ? (FREQ_TIERS.has(segTier) ? t.opacity : (segTier === 'every_30' ? t.opacity * 0.45 : t.opacity * 0.30))
@@ -1527,18 +1706,7 @@ function reclassify(winStart, winEnd) {
     }
   }
 
-  // ── 2. Bring frequent routes to front ──
-  // Draw order: weakest service first, strongest last
-  for (const tier of ['no_service', 'worse_than_60', 'every_60', 'every_30', 'freq_standard', 'freq_very', 'freq_ultra']) {
-    for (const rid of gRouteIds) {
-      const pl = gRoutePolylines.get(rid);
-      if (!pl) continue;
-      const t = gCurrentRouteTier.get(rid) || 'no_service';
-      if (t === tier) pl.bringToFront();
-    }
-  }
-
-  // ── 3. Rebuild combined_frequent ──
+  // ── 2. Rebuild combined_frequent ──
   if (gCombinedGroup) {
     gCombinedGroup.clearLayers();
   }
@@ -1550,6 +1718,10 @@ function reclassify(winStart, winEnd) {
     for (const [tid, timedStops] of gTripStopTimes) {
       const routeId = gTripToRoute.get(tid);
       if (!routeId) continue;
+      if (dirFilter !== 'both') {
+        const tripDir = gTripToDir.get(tid);
+        if (tripDir !== undefined && tripDir !== dirFilter) continue;
+      }
       if (!timedStops || timedStops.length < 2) continue;
 
       for (let i = 0; i < timedStops.length - 1; i++) {
@@ -1596,19 +1768,20 @@ function reclassify(winStart, winEnd) {
 
       const routeLabels = [...entry.routes].map(rid => gRouteNames.get(rid) || rid).join(' + ');
 
-      L.polyline(latlngs, {
+      const layer = L.polyline(latlngs, {
         color:   colorForMetric(evalRes.metric),
         weight:  combTier.weight,
         opacity: combTier.opacity,
-      })
-      .bindTooltip(
+      });
+      layer._fmDrawTier = evalRes.tier;
+      layer.bindTooltip(
         `<strong>Combined Frequent Corridor</strong><br>` +
         `Routes: ${routeLabels}<br>` +
         `Approx segment length: ${segKmLabel}<br>` +
         evalRes.label,
         { sticky: true, direction: 'top' }
-      )
-      .addTo(gCombinedGroup);
+      );
+      layer.addTo(gCombinedGroup);
     }
   }
   tierCounts['combined_frequent'] = combCount;
@@ -1619,6 +1792,11 @@ function reclassify(winStart, winEnd) {
   } else if (!map.hasLayer(gCombinedGroup)) {
     gCombinedGroup.addTo(map);
   }
+
+  // ── 3. Final draw order pass ──
+  // Segment colors are assigned per segment/corridor, so reorder by color tier
+  // after everything has been styled and recreated.
+  bringServiceLayersToFront();
 
   // ── 4. Update legend counts and strict-mode labels ──
   const strict = appState.strictFrequent;
@@ -1678,9 +1856,11 @@ function renderMap(meta, options = {}) {
 
     // Try segment-based rendering using stop order + shape geometry
     if (stopOrder) {
-      // Pick direction with most stops
+      // Pick direction with most stops (respecting direction filter)
+      const dirFilter = appState.directionFilter;
       let bestStops = null;
-      for (const [, stops] of stopOrder) {
+      for (const [dir, stops] of stopOrder) {
+        if (dirFilter !== 'both' && dir !== dirFilter) continue;
         if (!bestStops || stops.length > bestStops.length) bestStops = stops;
       }
       if (bestStops && bestStops.length >= 2) {
@@ -1782,7 +1962,7 @@ function renderMap(meta, options = {}) {
     legend.insertBefore(item, exportBtn);
   }
 
-  legendTitle.textContent = `${gCityName || 'Frequency Tiers'} (${appState.dayType}, ${appState.analysisTab}, ${appState.classifierModel})`;
+  updateLegendTitle();
 
   // Show map UI
   legend.style.display    = 'block';
@@ -1811,7 +1991,7 @@ function renderMap(meta, options = {}) {
       const dirDeps = gRouteDirDeps.get(rid);
       const stopDeps = gRouteStopDeps.get(rid);
       const evalRes = dirDeps
-        ? evaluateRoute(dirDeps, ws, we, appState.classifierModel, stopDeps)
+        ? evaluateRoute(dirDeps, ws, we, appState.classifierModel, stopDeps, appState.directionFilter)
         : { tier: 'no_service', metric: Infinity, metricKind: appState.classifierModel === 'headway' ? 'p85_gap' : 'avg_headway', count: 0 };
 
       features.push({
@@ -1824,6 +2004,7 @@ function renderMap(meta, options = {}) {
           analysis_tab: appState.analysisTab,
           classification_mode: appState.classifierModel,
           direction_policy: appState.directionPolicy,
+          direction_filter: appState.directionFilter,
           corridor_mode: appState.corridorMode,
           include_frequencies: appState.includeFrequencies,
           tier: evalRes.tier,
